@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from services.claude_analyzer import analyzer
 from services.polymarket_client import polymarket_client
+from services.supabase_sync import supabase_sync
 
 # Load environment variables
 load_dotenv()
@@ -66,7 +67,8 @@ async def root():
 async def get_markets(
     limit: int = 20,
     offset: int = 0,
-    active: bool = True
+    active: bool = True,
+    sync: bool = True
 ):
     """
     Get list of active prediction markets from Polymarket
@@ -75,18 +77,41 @@ async def get_markets(
     - limit: Number of markets to return (default 20)
     - offset: Pagination offset (default 0)
     - active: Only show active markets (default true)
+    - sync: Sync from Polymarket to Supabase (default true)
     """
     try:
-        markets = await polymarket_client.get_markets(
-            limit=limit,
-            offset=offset,
-            active=active
-        )
-        return {
-            "success": True,
-            "count": len(markets),
-            "markets": markets
-        }
+        if sync:
+            # Fetch from Polymarket and sync to Supabase
+            polymarket_markets = await polymarket_client.get_markets(
+                limit=limit,
+                offset=offset,
+                active=active
+            )
+
+            # Sync to Supabase
+            await supabase_sync.sync_markets_batch(polymarket_markets)
+
+            return {
+                "success": True,
+                "count": len(polymarket_markets),
+                "markets": polymarket_markets,
+                "synced": True
+            }
+        else:
+            # Just fetch from Supabase
+            markets = await supabase_sync.get_markets(
+                limit=limit,
+                offset=offset,
+                status="active" if active else "all"
+            )
+
+            return {
+                "success": True,
+                "count": len(markets),
+                "markets": markets,
+                "synced": False
+            }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -125,13 +150,31 @@ async def analyze_market(request: AnalyzeMarketRequest):
     - news_context: Optional list of recent news articles
     """
     try:
-        # Get market data
+        # Check if we have recent analysis in Supabase
+        existing_analysis = await supabase_sync.get_latest_analysis(request.condition_id)
+
+        # If analysis is less than 1 hour old, return it
+        if existing_analysis:
+            analyzed_at = datetime.fromisoformat(existing_analysis["analyzed_at"])
+            age_hours = (datetime.utcnow() - analyzed_at).total_seconds() / 3600
+
+            if age_hours < 1:
+                return {
+                    "success": True,
+                    "analysis": existing_analysis,
+                    "cached": True
+                }
+
+        # Get market data from Polymarket
         market = await polymarket_client.get_market_detail(request.condition_id)
 
         if not market:
             raise HTTPException(status_code=404, detail="Market not found")
 
-        # Run AI analysis
+        # Sync market to Supabase
+        await supabase_sync.sync_market(market)
+
+        # Run AI analysis with Claude
         analysis = await analyzer.analyze_market(
             market_title=market["title"],
             market_description=market["description"],
@@ -143,13 +186,21 @@ async def analyze_market(request: AnalyzeMarketRequest):
             recent_news=request.news_context
         )
 
+        # Save analysis to Supabase
+        analysis_id = await supabase_sync.save_ai_analysis(
+            market_id=request.condition_id,
+            analysis=analysis
+        )
+
         # Add metadata
+        analysis["id"] = analysis_id
         analysis["market_id"] = request.condition_id
         analysis["analyzed_at"] = datetime.utcnow().isoformat()
 
         return {
             "success": True,
-            "analysis": analysis
+            "analysis": analysis,
+            "cached": False
         }
 
     except HTTPException:
